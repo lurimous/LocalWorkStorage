@@ -10,6 +10,7 @@ import os
 import re
 import io
 import shutil
+import zipfile
 import mimetypes
 import logging
 import platform
@@ -43,7 +44,7 @@ BASE_DIR = (
 )
 AUDIT_LOG = (_HERE / _cfg.get("audit",  "log_file",   fallback="./audit.log")).resolve()
 _HOST     = _cfg.get("server", "host", fallback="0.0.0.0")
-_PORT     = _cfg.getint("server", "port", fallback=5000)
+_PORT     = _cfg.getint("server", "port", fallback=80)
 _MAX_GB   = _cfg.getfloat("server", "max_upload_gb", fallback=10)
 
 app = Flask(__name__)
@@ -217,6 +218,54 @@ def api_delete():
     return jsonify(ok=True)
 
 
+@app.route("/api/bulk_delete", methods=["POST"])
+def api_bulk_delete():
+    data  = request.get_json(silent=True) or {}
+    paths = data.get("paths", [])
+    if not paths:
+        abort(400, "Paths required")
+    errors = []
+    for path in paths:
+        try:
+            p = safe_path(path)
+            if not p.exists():
+                continue
+            if p.is_dir():
+                def _onerr(func, fpath, _):
+                    os.chmod(fpath, 0o777); func(fpath)
+                shutil.rmtree(p, onerror=_onerr)
+                audit("BULK_DELETE_DIR", path)
+            else:
+                p.unlink()
+                audit("BULK_DELETE", path)
+        except Exception as e:
+            errors.append(f"{path}: {e}")
+    return jsonify(ok=not errors, errors=errors), (207 if errors else 200)
+
+
+@app.route("/api/zip")
+def api_zip():
+    path = request.args.get("path", "")
+    d = safe_path(path)
+    if not d.is_dir():
+        abort(400, "Not a directory")
+    audit("ZIP_DOWNLOAD", path)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in d.rglob("*"):
+            try:
+                if f.is_file():
+                    z.write(f, f.relative_to(d))
+            except (PermissionError, OSError):
+                pass
+    buf.seek(0)
+    zip_name = (d.name or "download") + ".zip"
+    return Response(
+        buf.read(), mimetype="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'}
+    )
+
+
 @app.route("/api/thumb")
 def api_thumb():
     path = request.args.get("path", "")
@@ -302,6 +351,68 @@ def api_default_pins():
     return jsonify(pins=pins)
 
 
+@app.route("/api/ping")
+def api_ping():
+    import socket
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        ip = "127.0.0.1"
+    return jsonify(ok=True, app="LocalWorkStorage", ip=ip, port=_PORT)
+
+
+@app.route("/api/stats")
+def api_stats():
+    import shutil
+    result = {}
+    try:
+        du = shutil.disk_usage(BASE_DIR)
+        result["disk"] = {
+            "total": du.total, "used": du.used, "free": du.free,
+            "percent": round(du.used / du.total * 100, 1) if du.total else 0,
+        }
+    except Exception:
+        result["disk"] = None
+    try:
+        import psutil
+        result["cpu"] = {"percent": psutil.cpu_percent(interval=0.2)}
+        vm = psutil.virtual_memory()
+        result["ram"] = {"total": vm.total, "used": vm.used, "percent": round(vm.percent, 1)}
+    except ImportError:
+        result["cpu"] = None
+        result["ram"] = None
+    return jsonify(**result)
+
+
+@app.route("/api/raw")
+def api_raw():
+    """Serve file inline (no attachment header) so browsers can render images, video, PDF."""
+    path = request.args.get("path", "")
+    f = safe_path(path)
+    if not f.is_file():
+        abort(404, "File not found")
+    audit("VIEW", path)
+    mime, _ = mimetypes.guess_type(f.name)
+    return send_file(f, mimetype=mime or "application/octet-stream")
+
+
+@app.route("/api/preview")
+def api_preview():
+    """Return text file content (≤2 MB) as JSON for inline code/text preview."""
+    path = request.args.get("path", "")
+    f = safe_path(path)
+    if not f.is_file():
+        abort(404, "File not found")
+    if f.stat().st_size > 2 * 1024 * 1024:
+        abort(413, "File too large to preview (max 2 MB)")
+    audit("PREVIEW", path)
+    try:
+        text = f.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        abort(500, f"Could not read file: {e}")
+    return jsonify(content=text, ext=f.suffix.lstrip(".").lower())
+
+
 @app.route("/api/audit")
 def api_audit():
     n = min(int(request.args.get("n", 500)), 2000)
@@ -325,7 +436,7 @@ HTML = """<!DOCTYPE html>
 @font-face { font-family: "EBGaramond"; src: url("/fonts/EBGaramond.ttf") format("truetype"); font-weight: 400 800; }
 @font-face { font-family: "Playwrite";  src: url("/fonts/playwrite.ttf")  format("truetype"); font-weight: 400; }
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: "StackSans", "Outfit", sans-serif; background: #f5f5f5; color: #000; min-height: 100vh; }
+body { font-family: "Outfit", sans-serif; background: #f5f5f5; color: #000; min-height: 100vh; }
 
 /* ── Top nav (perekaperabot style) ── */
 .topnav { background: #000; border-bottom: 1px solid #1a1a1a; position: sticky; top: 0; z-index: 50; transition: box-shadow .3s ease; }
@@ -333,8 +444,8 @@ body { font-family: "StackSans", "Outfit", sans-serif; background: #f5f5f5; colo
 .topnav-inner { max-width: 1280px; margin: 0 auto; padding: 0 32px; height: 68px; display: flex; align-items: center; justify-content: space-between; gap: 24px; }
 .nav-brand { display: flex; align-items: center; gap: 14px; cursor: default; flex-shrink: 0; }
 .nav-brand-text { display: flex; flex-direction: column; justify-content: center; line-height: 1; }
-.nav-brand-name { font-family: "StackSans", sans-serif; font-size: 19px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: #fff; }
-.nav-brand-sub  { font-family: "StackSans", sans-serif; font-size: 8.5px; color: #a3a3a3; letter-spacing: .18em; text-transform: uppercase; margin-top: 4px; }
+.nav-brand-name { font-family: "Outfit", sans-serif; font-size: 19px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: #fff; }
+.nav-brand-sub  { font-family: "Outfit", sans-serif; font-size: 8.5px; color: #a3a3a3; letter-spacing: .18em; text-transform: uppercase; margin-top: 4px; }
 .nav-actions { display: flex; align-items: center; gap: 10px; }
 .view-toggle { border-color: #333; }
 .view-btn { color: #666; }
@@ -359,7 +470,7 @@ body { font-family: "StackSans", "Outfit", sans-serif; background: #f5f5f5; colo
 .btn-danger { background: #ef4444; color: #fff; border: 1px solid #ef4444; }
 .btn-danger:hover:not(:disabled) { background: #dc2626; border-color: #dc2626; }
 .btn-ghost { background: transparent; color: #525252; border: 1px solid #e5e5e5; }
-.btn-ghost:hover:not(:disabled) { background: #f5f5f5; color: #000; }
+.btn-ghost:hover:not(:disabled) { background: #f5f5f5; }
 .btn-sm { padding: 4px 10px; font-size: 12px; }
 .btn-log { background: transparent; color: #a3a3a3; border: 1px solid #525252; }
 .btn-log:hover { background: #222; color: #fff; }
@@ -388,6 +499,32 @@ body { font-family: "StackSans", "Outfit", sans-serif; background: #f5f5f5; colo
 .pin-home.pin-active { background: #FFCE1B; }
 .sidebar-sep { height: 1px; background: #e5e5e5; margin: 6px 0; }
 .main { flex: 1; min-width: 0; padding: 24px; }
+
+/* ── Search ── */
+.search-wrap { position: relative; }
+.search-wrap input { padding: 7px 28px 7px 12px; border: 1px solid #e5e5e5; border-radius: 6px; font-size: 13px; font-family: inherit; outline: none; width: 190px; transition: border-color .15s, width .2s; }
+.search-wrap input:focus { border-color: #FFCE1B; width: 240px; }
+.search-clear { position: absolute; right: 7px; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; color: #a3a3a3; font-size: 15px; display: none; padding: 0; }
+.search-clear.vis { display: block; }
+
+/* ── Bulk action bar ── */
+.bulk-bar { display: none; align-items: center; gap: 10px; background: #FFCE1B; padding: 9px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 13px; font-weight: 600; animation: fadeIn .15s ease; }
+.bulk-bar.active { display: flex; }
+.bulk-spacer { flex: 1; }
+
+/* ── Sortable table headers ── */
+thead th.sortable { cursor: pointer; user-select: none; }
+thead th.sortable:hover { background: #ececec; }
+.sort-ic { margin-left: 3px; opacity: .3; font-size: 10px; }
+.sort-ic.on { opacity: 1; }
+.th-cb { width: 36px; padding: 11px 8px !important; }
+
+/* ── Selection ── */
+.sel-cb, .card-cb { width: 15px; height: 15px; cursor: pointer; accent-color: #000; }
+.sel-row { background: #fffde7 !important; }
+.file-card.selected { outline: 2px solid #FFCE1B; outline-offset: -2px; }
+.card-cb-wrap { position: absolute; top: 6px; left: 6px; z-index: 2; opacity: 0; transition: opacity .15s; pointer-events: none; background: rgba(255,255,255,.85); border-radius: 4px; padding: 2px; }
+.file-card:hover .card-cb-wrap, .file-card.selected .card-cb-wrap { opacity: 1; pointer-events: auto; }
 
 .drop-zone { border: 2px dashed #FFCE1B; border-radius: 10px; padding: 24px; text-align: center; color: #000; margin-bottom: 16px; font-size: 14px; background: #fffde7; transition: background .15s; display: none; }
 .drop-zone.drag-over { background: #fff3b0; border-color: #e6b800; }
@@ -461,12 +598,12 @@ td { padding: 9px 16px; vertical-align: middle; }
 
 /* ── Tooltip button ── */
 .tip-btn { position: relative; }
-.tip-btn::after { content: attr(data-tip); position: absolute; top: calc(100% + 7px); left: 50%; transform: translateX(-50%); background: #000; color: #fff; font-size: 11px; font-family: "Outfit", sans-serif; white-space: nowrap; padding: 5px 10px; border-radius: 5px; pointer-events: none; opacity: 0; transition: opacity .15s; z-index: 10; }
+.tip-btn::after { content: attr(data-tip); position: absolute; top: calc(100% + 7px); left: 50%; transform: translateX(-50%); background: #000; color: #fff; font-size: 11px; white-space: nowrap; padding: 5px 10px; border-radius: 5px; pointer-events: none; opacity: 0; transition: opacity .15s; z-index: 10; }
 .tip-btn:hover::after { opacity: 1; }
 
 /* ── Context menu ── */
 #ctx-menu { position: fixed; background: #fff; border: 1px solid #e5e5e5; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,.12); z-index: 400; min-width: 168px; padding: 4px 0; display: none; animation: fadeUp .14s cubic-bezier(.22,1,.36,1); }
-#ctx-menu li { list-style: none; padding: 9px 16px; font-size: 13px; font-family: "Outfit", sans-serif; cursor: pointer; display: flex; align-items: center; gap: 10px; color: #000; transition: background .1s; user-select: none; }
+#ctx-menu li { list-style: none; padding: 9px 16px; font-size: 13px; cursor: pointer; display: flex; align-items: center; gap: 10px; color: #000; transition: background .1s; user-select: none; }
 #ctx-menu li:hover { background: #f5f5f5; }
 #ctx-menu li.ctx-danger { color: #ef4444; }
 #ctx-menu li.ctx-danger:hover { background: #fff5f5; }
@@ -480,6 +617,42 @@ td { padding: 9px 16px; vertical-align: middle; }
 .btn { transition: background .15s, opacity .15s, transform .1s, box-shadow .15s; }
 .btn:hover:not(:disabled) { transform: translateY(-1px); }
 .btn:active:not(:disabled) { transform: translateY(0); }
+
+/* ── Home stats dashboard ── */
+.home-stats { margin-bottom: 20px; }
+.home-section-label { font-size: 10px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: #a3a3a3; margin-bottom: 10px; }
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.stat-card { background: #fff; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,.06); padding: 18px 20px; }
+.stat-label { font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: #a3a3a3; margin-bottom: 8px; }
+.stat-value { font-size: 26px; font-weight: 700; color: #000; line-height: 1.1; }
+.stat-sub { font-size: 12px; color: #a3a3a3; margin-top: 4px; }
+.stat-bar-wrap { background: #e5e5e5; border-radius: 99px; height: 5px; margin-top: 12px; overflow: hidden; }
+.stat-bar { height: 100%; border-radius: 99px; background: #FFCE1B; transition: width .5s ease; }
+.stat-bar.warn { background: #f97316; }
+.stat-bar.crit { background: #ef4444; }
+.pins-home-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; }
+.pin-home-card { background: #fff; border-radius: 10px; border: 1px solid #e5e5e5; padding: 16px 12px; cursor: pointer; transition: box-shadow .15s, transform .12s; display: flex; flex-direction: column; align-items: center; gap: 6px; text-align: center; }
+.pin-home-card:hover { box-shadow: 0 6px 20px rgba(0,0,0,.1); transform: translateY(-2px); }
+.pin-home-icon { font-size: 30px; line-height: 1; }
+.pin-home-name { font-size: 12.5px; font-weight: 500; color: #000; word-break: break-word; }
+
+/* ── Preview modal ── */
+.prev-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.88); z-index: 300; display: flex; flex-direction: column; }
+.prev-header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #111; color: #fff; flex-shrink: 0; border-bottom: 1px solid #222; }
+.prev-title { flex: 1; font-size: 14px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.prev-close { background: none; border: none; color: #aaa; font-size: 26px; cursor: pointer; padding: 0 4px; line-height: 1; }
+.prev-close:hover { color: #FFCE1B; }
+.prev-body { flex: 1; overflow: hidden; display: flex; align-items: center; justify-content: center; position: relative; min-height: 0; background: #0d0d0d; }
+.prev-content { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; overflow: auto; }
+.prev-nav { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(0,0,0,.55); color: #fff; border: none; border-radius: 50%; width: 44px; height: 44px; font-size: 20px; cursor: pointer; z-index: 1; transition: background .15s; display: flex; align-items: center; justify-content: center; }
+.prev-nav:hover { background: rgba(0,0,0,.9); }
+.prev-nav-prev { left: 14px; }
+.prev-nav-next { right: 14px; }
+.prev-img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+.prev-video { max-width: 100%; max-height: 100%; display: block; outline: none; }
+.prev-pdf { width: 100%; height: 100%; border: none; display: block; }
+.prev-code { margin: 0; padding: 24px 28px; background: #1e1e1e; color: #d4d4d4; font-family: "Consolas","Courier New",monospace; font-size: 13px; line-height: 1.65; overflow: auto; width: 100%; height: 100%; white-space: pre; tab-size: 4; box-sizing: border-box; }
+.prev-footer { display: flex; align-items: center; justify-content: center; padding: 8px; background: #111; color: #555; font-size: 12px; flex-shrink: 0; border-top: 1px solid #222; }
 </style>
 </head>
 <body>
@@ -520,8 +693,19 @@ td { padding: 9px 16px; vertical-align: middle; }
   <div class="toolbar">
     <button class="btn btn-ghost btn-back" id="btn-back" onclick="goBack()" style="display:none">&#8592; Back</button>
     <nav class="breadcrumb" id="breadcrumb"></nav>
+    <div class="search-wrap">
+      <input id="search-input" type="search" placeholder="Search..." oninput="onSearch(this.value)" autocomplete="off">
+      <button class="search-clear" id="search-clear" onclick="clearSearch()">&#215;</button>
+    </div>
     <button class="btn btn-primary tip-btn" data-tip="Upload files" onclick="openUpload()">&#8679; Upload</button>
     <button class="btn btn-secondary tip-btn" data-tip="New folder" onclick="openMkdir()">&#43; New Folder</button>
+  </div>
+
+  <div id="bulk-bar" class="bulk-bar">
+    <span id="bulk-count">0 selected</span>
+    <span class="bulk-spacer"></span>
+    <button class="btn btn-secondary btn-sm" onclick="clearSel()">&#215; Clear</button>
+    <button class="btn btn-danger btn-sm" onclick="bulkDelete()">&#128465; Delete selected</button>
   </div>
 
   <div id="upload-progress" class="upload-progress"></div>
@@ -530,6 +714,15 @@ td { padding: 9px 16px; vertical-align: middle; }
     <div style="font-size:32px;margin-bottom:8px">&#8679;</div>
     Drop files here to upload, or <label for="file-input">browse</label>
     <input type="file" id="file-input" multiple style="display:none" onchange="handleFileInput(this)">
+  </div>
+
+  <div id="home-stats" class="home-stats" style="display:none">
+    <p class="home-section-label">System</p>
+    <div id="stats-grid" class="stats-grid"></div>
+    <div id="home-pins-section" style="display:none">
+      <p class="home-section-label">Pinned Folders</p>
+      <div id="home-pins-grid" class="pins-home-grid"></div>
+    </div>
   </div>
 
   <div id="file-container" class="card"></div>
@@ -588,6 +781,21 @@ td { padding: 9px 16px; vertical-align: middle; }
   </div>
 </div>
 
+<!-- Preview modal -->
+<div id="modal-preview" class="prev-backdrop" style="display:none">
+  <div class="prev-header">
+    <button class="prev-close" onclick="closePreview()" title="Close (Esc)">&#215;</button>
+    <span class="prev-title" id="prev-title"></span>
+    <a id="prev-dl" class="btn btn-ghost btn-sm" href="#" title="Download" style="border-color:#444;color:#aaa">&#8681; Download</a>
+  </div>
+  <div class="prev-body">
+    <button class="prev-nav prev-nav-prev" id="prev-btn-prev" onclick="prevPreview()" title="Previous (&#8592;)">&#8592;</button>
+    <div id="prev-content" class="prev-content"></div>
+    <button class="prev-nav prev-nav-next" id="prev-btn-next" onclick="nextPreview()" title="Next (&#8594;)">&#8594;</button>
+  </div>
+  <div class="prev-footer"><span id="prev-counter"></span></div>
+</div>
+
 <div class="toast-container" id="toasts"></div>
 
 <script>
@@ -614,10 +822,17 @@ function initViewToggle() {
 // ── Navigation ─────────────────────────────────────────────────────────────
 function navigate(path) {
   currentPath = path;
+  _sel.clear(); updateBulkBar();
+  _search = ''; document.getElementById('search-input').value = ''; document.getElementById('search-clear').classList.remove('vis');
   loadDir(path);
   updateBreadcrumb(path);
   document.getElementById('btn-back').style.display = path ? '' : 'none';
   renderPins();
+  if (path === '') { loadHomeStats(); }
+  else {
+    document.getElementById('home-stats').style.display = 'none';
+    if (_statsTimer) { clearInterval(_statsTimer); _statsTimer = null; }
+  }
 }
 
 function goBack() {
@@ -652,45 +867,157 @@ async function loadDir(path) {
   renderFiles(lastEntries);
 }
 
+// ── Sort ───────────────────────────────────────────────────────────────────
+var _sort = { field: 'name', dir: 'asc' };
+
+function setSort(field) {
+  _sort.dir = (_sort.field === field && _sort.dir === 'asc') ? 'desc' : 'asc';
+  _sort.field = field;
+  renderFiles(lastEntries);
+}
+
+function sortEntries(entries) {
+  return entries.slice().sort(function(a, b) {
+    if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+    var av, bv;
+    if (_sort.field === 'size')     { av = a.size || 0;     bv = b.size || 0; }
+    else if (_sort.field === 'modified') { av = a.modified || 0; bv = b.modified || 0; }
+    else { av = a.name.toLowerCase(); bv = b.name.toLowerCase(); }
+    var cmp = av < bv ? -1 : av > bv ? 1 : 0;
+    return _sort.dir === 'asc' ? cmp : -cmp;
+  });
+}
+
+// ── Search / filter ────────────────────────────────────────────────────────
+var _search = '';
+
+function onSearch(val) {
+  _search = val.trim();
+  document.getElementById('search-clear').classList.toggle('vis', !!_search);
+  renderFiles(lastEntries);
+}
+
+function clearSearch() {
+  _search = '';
+  document.getElementById('search-input').value = '';
+  document.getElementById('search-clear').classList.remove('vis');
+  renderFiles(lastEntries);
+}
+
+function filterEntries(entries) {
+  if (!_search) return entries;
+  var q = _search.toLowerCase();
+  return entries.filter(function(e) { return e.name.toLowerCase().indexOf(q) !== -1; });
+}
+
+// ── Bulk selection ─────────────────────────────────────────────────────────
+var _sel = new Set();
+
+function toggleSel(path, checked) {
+  checked ? _sel.add(path) : _sel.delete(path);
+  updateBulkBar();
+}
+
+function toggleCardSel(el, path) {
+  el.closest('.file-card').classList.toggle('selected', el.checked);
+  toggleSel(path, el.checked);
+}
+
+function toggleSelAll(checked) {
+  document.querySelectorAll('.sel-cb[data-path]').forEach(function(cb) {
+    cb.checked = checked;
+    checked ? _sel.add(cb.dataset.path) : _sel.delete(cb.dataset.path);
+  });
+  document.querySelectorAll('.file-card[data-path]').forEach(function(c) {
+    c.classList.toggle('selected', checked);
+    var cb = c.querySelector('.card-cb');
+    if (cb) cb.checked = checked;
+    checked ? _sel.add(c.dataset.path) : _sel.delete(c.dataset.path);
+  });
+  updateBulkBar();
+}
+
+function clearSel() {
+  _sel.clear();
+  document.querySelectorAll('.sel-cb, .card-cb').forEach(function(cb) { cb.checked = false; });
+  document.querySelectorAll('.file-card.selected').forEach(function(c) { c.classList.remove('selected'); });
+  updateBulkBar();
+}
+
+function updateBulkBar() {
+  var n = _sel.size;
+  document.getElementById('bulk-bar').classList.toggle('active', n > 0);
+  document.getElementById('bulk-count').textContent = n + ' selected';
+}
+
+async function bulkDelete() {
+  var n = _sel.size;
+  if (!n) return;
+  if (!confirm('Delete ' + n + ' item' + (n > 1 ? 's' : '') + '? This cannot be undone.')) return;
+  const res = await fetch('/api/bulk_delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ paths: Array.from(_sel) })
+  });
+  if (res.ok || res.status === 207) {
+    toast('Deleted ' + n + ' item' + (n > 1 ? 's' : ''), 'success');
+    _sel.clear(); updateBulkBar(); loadDir(currentPath);
+  } else { toast('Delete failed', 'error'); }
+}
+
+function zipFolder(path) {
+  location.href = '/api/zip?path=' + encodeURIComponent(path);
+}
+
 function renderFiles(entries) {
   lastEntries = entries;
-  if (currentView === 'list') renderList(entries);
-  else renderGrid(entries, currentView === 'thumb');
+  var processed = sortEntries(filterEntries(entries));
+  if (currentView === 'list') renderList(processed);
+  else renderGrid(processed, currentView === 'thumb');
 }
 
 // ── List view ──────────────────────────────────────────────────────────────
 function renderList(entries) {
   const c = document.getElementById('file-container');
-  if (!entries.length) {
-    c.innerHTML = '<div class="empty-state"><div class="big">&#128194;</div>This folder is empty</div>';
-    return;
+  const empty = _search
+    ? '<div class="empty-state"><div class="big">&#128269;</div>No results for &ldquo;' + esc(_search) + '&rdquo;</div>'
+    : '<div class="empty-state"><div class="big">&#128194;</div>This folder is empty</div>';
+  if (!entries.length) { c.innerHTML = empty; return; }
+
+  function si(field) {
+    if (_sort.field !== field) return '<span class="sort-ic">&#8597;</span>';
+    return '<span class="sort-ic on">' + (_sort.dir === 'asc' ? '&#8593;' : '&#8595;') + '</span>';
   }
+
   c.innerHTML =
     '<div class="table-wrap"><table>' +
     '<thead><tr>' +
-    '<th style="width:99%">Name</th>' +
-    '<th style="min-width:90px">Size</th>' +
-    '<th style="min-width:160px">Modified</th>' +
-    '<th style="min-width:140px;text-align:right">Actions</th>' +
+    '<th class="th-cb"><input type="checkbox" class="sel-cb" id="sel-all" onchange="toggleSelAll(this.checked)"></th>' +
+    '<th class="sortable" data-sort="name" onclick="setSort(this.dataset.sort)" style="width:99%">Name ' + si('name') + '</th>' +
+    '<th class="sortable" data-sort="size" onclick="setSort(this.dataset.sort)" style="min-width:90px">Size ' + si('size') + '</th>' +
+    '<th class="sortable" data-sort="modified" onclick="setSort(this.dataset.sort)" style="min-width:160px">Modified ' + si('modified') + '</th>' +
+    '<th style="min-width:150px;text-align:right">Actions</th>' +
     '</tr></thead><tbody>' +
-    entries.map((e, i) => {
-      const delay = Math.min(i * 28, 400);
-      const icon = e.is_dir ? '&#128193;' : fileIcon(e.name);
-      const nameCell = e.is_dir
-        ? '<a data-path="' + esc(e.path) + '" onclick="navigate(this.dataset.path)">' + esc(e.name) + '</a>'
-        : '<span>' + esc(e.name) + '</span>';
-      const size = e.is_dir
-        ? '<span class="text-muted">&mdash;</span>'
-        : '<span class="text-muted">' + fmtSize(e.size) + '</span>';
-      const mod = '<span class="text-muted">' + fmtDate(e.modified) + '</span>';
-      const dlBtn = e.is_dir
-        ? ''
+    entries.map(function(e, i) {
+      var delay = Math.min(i * 28, 400);
+      var ep = esc(e.path), en = esc(e.name);
+      var icon = e.is_dir ? '&#128193;' : fileIcon(e.name);
+      var nameCell = e.is_dir
+        ? '<a data-path="' + ep + '" onclick="navigate(this.dataset.path)">' + en + '</a>'
+        : canPreview(e.name)
+          ? '<a data-path="' + ep + '" data-name="' + en + '" onclick="openPreviewEntry(this.dataset.path,this.dataset.name)">' + en + '</a>'
+          : '<a data-path="' + ep + '" onclick="dl(this.dataset.path)">' + en + '</a>';
+      var size = e.is_dir ? '<span class="text-muted">&mdash;</span>' : '<span class="text-muted">' + fmtSize(e.size) + '</span>';
+      var mod  = '<span class="text-muted">' + fmtDate(e.modified) + '</span>';
+      var dlBtn = e.is_dir
+        ? '<button class="btn btn-ghost btn-sm" data-path="' + ep + '" onclick="event.stopPropagation();zipFolder(this.dataset.path)" title="Download as ZIP">&#128230;</button>'
         : '<a class="btn btn-ghost btn-sm" href="/api/download?path=' + encodeURIComponent(e.path) + '" title="Download">&#8681;</a>';
-      const actions =
-        dlBtn +
-        '<button class="btn btn-ghost btn-sm" data-path="' + esc(e.path) + '" data-name="' + esc(e.name) + '" onclick="openRenameEl(this)" title="Rename">&#9998;</button>' +
-        '<button class="btn btn-danger btn-sm" data-path="' + esc(e.path) + '" data-name="' + esc(e.name) + '" data-isdir="' + e.is_dir + '" onclick="openDeleteEl(this)" title="Delete">&#128465;</button>';
-      return '<tr class="anim" style="animation-delay:' + delay + 'ms" data-path="' + esc(e.path) + '" data-name="' + esc(e.name) + '" data-isdir="' + e.is_dir + '">' +
+      var actions = dlBtn +
+        '<button class="btn btn-ghost btn-sm" data-path="' + ep + '" data-name="' + en + '" onclick="openRenameEl(this)" title="Rename">&#9998;</button>' +
+        '<button class="btn btn-danger btn-sm" data-path="' + ep + '" data-name="' + en + '" data-isdir="' + e.is_dir + '" onclick="openDeleteEl(this)" title="Delete">&#128465;</button>';
+      var isSel = _sel.has(e.path);
+      return '<tr class="anim' + (isSel ? ' sel-row' : '') + '" style="animation-delay:' + delay + 'ms" data-path="' + ep + '" data-name="' + en + '" data-isdir="' + e.is_dir + '">' +
+        '<td><input type="checkbox" class="sel-cb" data-path="' + ep + '" ' + (isSel ? 'checked' : '') + ' onclick="event.stopPropagation();toggleSel(this.dataset.path,this.checked)"></td>' +
         '<td><div class="td-name"><span class="list-icon">' + icon + '</span>' + nameCell + '</div></td>' +
         '<td>' + size + '</td>' +
         '<td>' + mod + '</td>' +
@@ -733,7 +1060,9 @@ function buildCard(e, showThumbs, idx) {
   const cardData = 'data-path="' + ep + '" data-name="' + en + '" data-isdir="' + isd + '"';
   const clickAttr = e.is_dir
     ? cardData + ' onclick="navigate(this.dataset.path)"'
-    : cardData + ' onclick="dl(this.dataset.path)"';
+    : canPreview(e.name)
+      ? cardData + ' onclick="openPreviewEntry(this.dataset.path,this.dataset.name)"'
+      : cardData + ' onclick="dl(this.dataset.path)"';
 
   const dlBtn = e.is_dir
     ? ''
@@ -750,7 +1079,13 @@ function buildCard(e, showThumbs, idx) {
     ? '<span class="card-meta">Folder</span>'
     : '<span class="card-meta">' + fmtSize(e.size) + '</span>';
 
-  return '<div class="file-card anim" style="animation-delay:' + delay + 'ms" ' + clickAttr + '>' +
+  var isSel = _sel.has(e.path);
+  var cbHtml = '<div class="card-cb-wrap" onclick="event.stopPropagation()">' +
+    '<input type="checkbox" class="card-cb" data-path="' + ep + '" ' + (isSel ? 'checked' : '') + ' onchange="toggleCardSel(this,this.dataset.path)">' +
+    '</div>';
+
+  return '<div class="file-card anim' + (isSel ? ' selected' : '') + '" style="animation-delay:' + delay + 'ms" ' + clickAttr + '>' +
+    cbHtml +
     preview +
     '<div class="card-body"><div class="card-name">' + esc(e.name) + '</div>' + meta + '</div>' +
     actions +
@@ -1079,6 +1414,7 @@ function ctxUpload()   { openUpload(); _hideCtx(); }
 function ctxMkdir()    { openMkdir();  _hideCtx(); }
 function ctxPin()      { if (_ctx) addPin(_ctx.path, _ctx.name); _hideCtx(); }
 function ctxUnpin()    { if (_ctx) removePin(_ctx.path); _hideCtx(); }
+function ctxZip()      { if (_ctx) zipFolder(_ctx.path); _hideCtx(); }
 
 document.addEventListener('contextmenu', function(e) {
   var item = e.target.closest('tr[data-path], .file-card[data-path]');
@@ -1090,13 +1426,15 @@ document.addEventListener('contextmenu', function(e) {
       : { icon: '📌', label: 'Pin folder',   fn: 'ctxPin'   };
     _showCtx(e.clientX, e.clientY, _ctx.isDir
       ? [
-          { icon: '📂', label: 'Open',   fn: 'ctxOpen' },
+          { icon: '📂', label: 'Open',            fn: 'ctxOpen' },
+          { icon: '📦', label: 'Download as ZIP', fn: 'ctxZip'  },
           pinEntry,
           '-',
           { icon: '✏️', label: 'Rename', fn: 'ctxRename' },
           { icon: '🗑️', label: 'Delete', fn: 'ctxDelete', danger: true },
         ]
       : [
+          ...(_ctx && canPreview(_ctx.name) ? [{ icon: '&#128065;', label: 'Preview', fn: 'ctxPreview' }] : []),
           { icon: '⬇️', label: 'Download', fn: 'ctxDownload' },
           '-',
           { icon: '✏️', label: 'Rename',   fn: 'ctxRename' },
@@ -1114,8 +1452,186 @@ document.addEventListener('contextmenu', function(e) {
 document.addEventListener('click', function(e) {
   if (!e.target.closest('#ctx-menu')) _hideCtx();
 });
-document.addEventListener('keydown', function(e) { if (e.key === 'Escape') _hideCtx(); });
+document.addEventListener('keydown', function(e) {
+  var pv = document.getElementById('modal-preview');
+  if (pv && pv.style.display !== 'none') {
+    if (e.key === 'Escape')     { closePreview(); return; }
+    if (e.key === 'ArrowLeft')  { prevPreview();  return; }
+    if (e.key === 'ArrowRight') { nextPreview();  return; }
+  }
+  if (e.key === 'Escape') _hideCtx();
+});
 window.addEventListener('scroll', _hideCtx, true);
+
+// ── Home stats dashboard ────────────────────────────────────────────────────
+var _statsTimer = null;
+
+async function loadHomeStats() {
+  var hs = document.getElementById('home-stats');
+  hs.style.display = 'block';
+  // Pinned folders (rendered once per visit)
+  var pinsSection = document.getElementById('home-pins-section');
+  if (_pins.length) {
+    pinsSection.style.display = '';
+    document.getElementById('home-pins-grid').innerHTML = _pins.map(function(p) {
+      return '<div class="pin-home-card anim" data-path="' + esc(p.path) + '" onclick="navigate(this.dataset.path)">' +
+        '<div class="pin-home-icon">' + (p.icon || '&#128193;') + '</div>' +
+        '<div class="pin-home-name">' + esc(p.name || p.path.split('/').pop() || 'Root') + '</div>' +
+        '</div>';
+    }).join('');
+  } else {
+    pinsSection.style.display = 'none';
+  }
+  // Initial stat render then start polling
+  await _fetchAndRenderStats(true);
+  if (_statsTimer) clearInterval(_statsTimer);
+  _statsTimer = setInterval(function() { _fetchAndRenderStats(false); }, 1000);
+}
+
+async function _fetchAndRenderStats(initial) {
+  try {
+    var res = await fetch('/api/stats');
+    if (!res.ok) return;
+    var d = await res.json();
+    if (initial) {
+      // Build card shells on first load
+      var cards = '';
+      if (d.cpu  != null) cards += _statCard('cpu',  'CPU Usage', d.cpu.percent.toFixed(1) + '%',  '', d.cpu.percent);
+      if (d.ram  != null) cards += _statCard('ram',  'Memory',    fmtSize(d.ram.used),
+        'of ' + fmtSize(d.ram.total) + ' &bull; ' + d.ram.percent.toFixed(1) + '%\u00a0used', d.ram.percent);
+      if (d.disk != null) cards += _statCard('disk', 'Storage',   fmtSize(d.disk.used),
+        'of ' + fmtSize(d.disk.total) + ' &bull; ' + fmtSize(d.disk.free) + '\u00a0free', d.disk.percent);
+      document.getElementById('stats-grid').innerHTML = cards ||
+        '<div class="stat-card" style="color:#a3a3a3;font-size:13px">Install psutil for CPU &amp; RAM stats.</div>';
+      setTimeout(function() {
+        document.querySelectorAll('.stat-bar[data-key]').forEach(function(b) {
+          b.style.width = b.dataset.pct + '%';
+        });
+      }, 30);
+    } else {
+      // Patch values in-place — no DOM rebuild, no flicker
+      if (d.cpu  != null) _patchStat('cpu',  d.cpu.percent.toFixed(1) + '%',  '', d.cpu.percent);
+      if (d.ram  != null) _patchStat('ram',  fmtSize(d.ram.used),
+        'of ' + fmtSize(d.ram.total) + ' &bull; ' + d.ram.percent.toFixed(1) + '%\u00a0used', d.ram.percent);
+      if (d.disk != null) _patchStat('disk', fmtSize(d.disk.used),
+        'of ' + fmtSize(d.disk.total) + ' &bull; ' + fmtSize(d.disk.free) + '\u00a0free', d.disk.percent);
+    }
+  } catch(e) {}
+}
+
+function _statCard(key, label, value, sub, pct) {
+  var barClass = pct >= 90 ? 'crit' : pct >= 70 ? 'warn' : '';
+  return '<div class="stat-card anim" data-stat="' + key + '">' +
+    '<div class="stat-label">' + esc(label) + '</div>' +
+    '<div class="stat-value">' + esc(value) + '</div>' +
+    (sub ? '<div class="stat-sub">' + sub + '</div>' : '') +
+    '<div class="stat-bar-wrap"><div class="stat-bar ' + barClass + '" data-key="' + key + '" data-pct="' + pct + '" style="width:0%"></div></div>' +
+    '</div>';
+}
+
+function _patchStat(key, value, sub, pct) {
+  var card = document.querySelector('.stat-card[data-stat="' + key + '"]');
+  if (!card) return;
+  card.querySelector('.stat-value').textContent = value;
+  var subEl = card.querySelector('.stat-sub');
+  if (subEl && sub) subEl.innerHTML = sub;
+  var bar = card.querySelector('.stat-bar');
+  if (bar) {
+    bar.style.width = pct + '%';
+    bar.className = 'stat-bar ' + (pct >= 90 ? 'crit' : pct >= 70 ? 'warn' : '');
+  }
+}
+
+// ── Inline preview ──────────────────────────────────────────────────────────
+var PREVIEW_IMG_EXTS = new Set(['jpg','jpeg','png','gif','webp','bmp','svg']);
+var PREVIEW_VID_EXTS = new Set(['mp4','webm','ogg','mov','m4v']);
+var PREVIEW_PDF_EXTS = new Set(['pdf']);
+var PREVIEW_TXT_EXTS = new Set(['txt','md','markdown','csv','json','xml','html','htm','css',
+  'js','ts','jsx','tsx','py','rb','php','java','c','cpp','h','hpp','cs','go','rs',
+  'sh','bat','ps1','yaml','yml','toml','ini','cfg','conf','log','sql','vue','svelte']);
+
+function _pext(name) {
+  return name.includes('.') ? name.split('.').pop().toLowerCase() : '';
+}
+
+function canPreview(name) {
+  var x = _pext(name);
+  return PREVIEW_IMG_EXTS.has(x) || PREVIEW_VID_EXTS.has(x) || PREVIEW_PDF_EXTS.has(x) || PREVIEW_TXT_EXTS.has(x);
+}
+
+var _pv = { entries: [], idx: 0 };
+
+function openPreviewEntry(path, name) {
+  _pv.entries = lastEntries.filter(function(e) { return !e.is_dir && canPreview(e.name); });
+  var idx = _pv.entries.findIndex(function(e) { return e.path === path; });
+  _pv.idx = idx >= 0 ? idx : 0;
+  _showPreview();
+}
+
+function _showPreview() {
+  var entry = _pv.entries[_pv.idx];
+  if (!entry) return;
+  var x = _pext(entry.name);
+  var n = _pv.entries.length;
+  document.getElementById('prev-title').textContent = entry.name;
+  document.getElementById('prev-dl').href = '/api/download?path=' + encodeURIComponent(entry.path);
+  document.getElementById('prev-counter').textContent = n > 1 ? (_pv.idx + 1) + ' / ' + n : '';
+  document.getElementById('prev-btn-prev').style.display = n > 1 ? '' : 'none';
+  document.getElementById('prev-btn-next').style.display = n > 1 ? '' : 'none';
+  document.getElementById('modal-preview').style.display = 'flex';
+  var cc = document.getElementById('prev-content');
+  cc.innerHTML = '<div style="color:#666;padding:24px">Loading\u2026</div>';
+  cc.style.alignItems = 'center';
+  var url = '/api/raw?path=' + encodeURIComponent(entry.path);
+  if (PREVIEW_IMG_EXTS.has(x)) {
+    cc.innerHTML = '<img class="prev-img" src="' + url + '" alt="' + esc(entry.name) + '">';
+  } else if (PREVIEW_VID_EXTS.has(x)) {
+    var mt = x === 'webm' ? 'video/webm' : x === 'ogg' ? 'video/ogg' : 'video/mp4';
+    cc.innerHTML = '<video class="prev-video" controls autoplay><source src="' + url + '" type="' + mt + '"></video>';
+  } else if (PREVIEW_PDF_EXTS.has(x)) {
+    cc.innerHTML = '<iframe class="prev-pdf" src="' + url + '"></iframe>';
+  } else {
+    fetch('/api/preview?path=' + encodeURIComponent(entry.path))
+      .then(function(r) { if (!r.ok) throw new Error('Preview unavailable (' + r.status + ')'); return r.json(); })
+      .then(function(d) {
+        var pre = document.createElement('pre');
+        pre.className = 'prev-code';
+        pre.innerHTML = _hlCode(d.content, d.ext);
+        cc.innerHTML = '';
+        cc.style.alignItems = 'flex-start';
+        cc.appendChild(pre);
+      })
+      .catch(function(err) {
+        cc.innerHTML = '<div style="color:#ef4444;padding:24px">' + esc(err.message) + '</div>';
+      });
+  }
+}
+
+function closePreview() {
+  document.getElementById('modal-preview').style.display = 'none';
+  var v = document.querySelector('#prev-content video');
+  if (v) { v.pause(); v.src = ''; }
+  document.getElementById('prev-content').style.alignItems = '';
+}
+
+function prevPreview() { _pv.idx = (_pv.idx - 1 + _pv.entries.length) % _pv.entries.length; _showPreview(); }
+function nextPreview() { _pv.idx = (_pv.idx + 1) % _pv.entries.length; _showPreview(); }
+function ctxPreview()  { if (_ctx) openPreviewEntry(_ctx.path, _ctx.name); _hideCtx(); }
+
+function _hlCode(code, ext) {
+  var e = esc(code);
+  var ph = [], p = 0;
+  // extract line comments to placeholders so keywords don\'t highlight inside them
+  e = e.replace(/(\/\/[^\\n]*|#[^\\n]*)/g, function(m) {
+    ph.push('<span style="color:#6a9955">' + m + '</span>');
+    return '\\x00' + (p++) + '\\x00';
+  });
+  var kws = 'function|var|let|const|if|else|for|while|return|import|export|from|class|extends|new|typeof|instanceof|true|false|null|undefined|async|await|try|catch|finally|throw|switch|case|break|continue|do|of|default|static|yield|void|delete|def|elif|pass|raise|except|lambda|None|True|False|global|nonlocal|del|assert|with|as|and|or|not|is';
+  e = e.replace(new RegExp('\\\\b(' + kws + ')\\\\b', 'g'), '<span style="color:#569cd6">$1</span>');
+  e = e.replace(/\\b(\\d+\\.?\\d*)\\b/g, '<span style="color:#b5cea8">$1</span>');
+  e = e.replace(/\\x00(\\d+)\\x00/g, function(_, i) { return ph[+i]; });
+  return e;
+}
 window.addEventListener('scroll', function() {
   document.getElementById('topnav').classList.toggle('nav-scrolled', window.scrollY > 10);
 });
