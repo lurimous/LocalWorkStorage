@@ -1,0 +1,8 @@
+venv/
+config.ini
+start.bat
+audit.log
+__pycache__/
+.claude/
+ffmpeg/
+ffmpeg.exe
